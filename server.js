@@ -204,9 +204,14 @@ function iniciar() {
   registrarBot(client);
   client.login(BOT_TOKEN).catch((e) => console.error('[resgate] Falha no login:', e.message));
 
+  process.on('unhandledRejection', (e) => console.error('[resgate] unhandledRejection:', e));
+  process.on('uncaughtException', (e) => console.error('[resgate] uncaughtException:', e));
+
   const app = express();
+  app.use((req, res, next) => { console.log(`[resgate] ${req.method} ${req.path.slice(0, 20)}`); next(); });
   registrarRotas(app);
-  app.listen(process.env.PORT || 3000, () => console.log('[resgate] Servidor web rodando'));
+  const porta = process.env.PORT || 3000;
+  app.listen(porta, '0.0.0.0', () => console.log(`[resgate] Servidor web rodando na porta ${porta}`));
 }
 
 module.exports = { registrarRotas, registrarBot, gerarLink, removerVencidos, iniciar };
