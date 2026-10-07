@@ -8,6 +8,11 @@ const {
   Client, GatewayIntentBits, Events, REST, Routes, SlashCommandBuilder, MessageFlags,
 } = require('discord.js');
 
+// Remove espaços/quebras de linha sobrando nas variáveis (erro comum ao colar na Railway)
+for (const nome of ['BASE_URL', 'CLIENT_ID', 'CLIENT_SECRET', 'BOT_TOKEN', 'GUILD_ID', 'CARGO_VIP_ID', 'OWNER_ID', 'DB_PATH']) {
+  if (process.env[nome]) process.env[nome] = process.env[nome].trim();
+}
+
 const {
   CLIENT_ID, CLIENT_SECRET, BOT_TOKEN, GUILD_ID, CARGO_VIP_ID, OWNER_ID,
 } = process.env;
@@ -160,19 +165,69 @@ function registrarRotas(app) {
   });
 }
 
-// ---------- Bot: comando /gerarlink + checagem de vencimentos ----------
+// ---------- Consulta de dias restantes ----------
+const diasRestantes = (expiraEm) => Math.ceil((expiraEm - Date.now()) / DIA_MS);
+
+// /dias            -> mostra os dias restantes de quem usou o comando
+// /dias usuario:@x -> só o dono pode consultar outra pessoa
+async function responderDias(interaction) {
+  const alvo = interaction.options.getUser('usuario');
+  if (alvo && interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Só o dono pode consultar outro usuário.', flags: MessageFlags.Ephemeral });
+  }
+  const user = alvo || interaction.user;
+  const a = db.prepare('SELECT expira_em FROM resgate_assinaturas WHERE user_id = ?').get(user.id);
+  if (!a) {
+    return interaction.reply({ content: `${user} não tem assinatura ativa.`, flags: MessageFlags.Ephemeral });
+  }
+  const ts = Math.floor(a.expira_em / 1000);
+  return interaction.reply({
+    content: `${user}: faltam **${diasRestantes(a.expira_em)} dia(s)**. Vence em <t:${ts}:D> (<t:${ts}:R>).`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// /assinaturas -> lista (só o dono) quem vence primeiro
+async function responderLista(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Sem permissão.', flags: MessageFlags.Ephemeral });
+  }
+  const total = db.prepare('SELECT COUNT(*) AS n FROM resgate_assinaturas').get().n;
+  if (!total) return interaction.reply({ content: 'Nenhuma assinatura ativa.', flags: MessageFlags.Ephemeral });
+  const linhas = db.prepare('SELECT user_id, expira_em FROM resgate_assinaturas ORDER BY expira_em ASC LIMIT 25').all();
+  const texto = linhas
+    .map((l) => `<@${l.user_id}> — ${diasRestantes(l.expira_em)} dia(s) (vence <t:${Math.floor(l.expira_em / 1000)}:d>)`)
+    .join('\n');
+  return interaction.reply({
+    content: `**Assinaturas ativas: ${total}** (as 25 que vencem primeiro)\n${texto}`.slice(0, 1900),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// ---------- Bot: comandos + checagem de vencimentos ----------
 function registrarBot(client) {
   const aoFicarOnline = async () => {
     console.log(`[resgate] Bot online como ${client.user.tag}`);
     try {
-      const comando = new SlashCommandBuilder()
-        .setName('gerarlink')
-        .setDescription('Gera um link único de resgate do cargo VIP')
-        .addUserOption((o) => o.setName('usuario').setDescription('Amarra o link a este usuário (opcional)'));
-      // POST cria/atualiza só este comando, sem apagar os outros do bot
-      await new REST({ version: '10' }).setToken(BOT_TOKEN)
-        .post(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: comando.toJSON() });
-      console.log('[resgate] Comando /gerarlink registrado');
+      const comandos = [
+        new SlashCommandBuilder()
+          .setName('gerarlink')
+          .setDescription('Gera um link único de resgate do cargo VIP')
+          .addUserOption((o) => o.setName('usuario').setDescription('Amarra o link a este usuário (opcional)')),
+        new SlashCommandBuilder()
+          .setName('dias')
+          .setDescription('Mostra quantos dias faltam da assinatura')
+          .addUserOption((o) => o.setName('usuario').setDescription('Consultar outro usuário (só o dono)')),
+        new SlashCommandBuilder()
+          .setName('assinaturas')
+          .setDescription('Lista as assinaturas ativas e os dias restantes (só o dono)'),
+      ];
+      // POST cria/atualiza só estes comandos, sem apagar os outros do bot
+      const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+      for (const c of comandos) {
+        await rest.post(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: c.toJSON() });
+      }
+      console.log('[resgate] Comandos registrados: /gerarlink, /dias, /assinaturas');
     } catch (e) {
       console.error('[resgate] Erro ao registrar comando:', e.message);
     }
@@ -183,7 +238,10 @@ function registrarBot(client) {
   else client.once(Events.ClientReady, aoFicarOnline);
 
   client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand() || interaction.commandName !== 'gerarlink') return;
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName === 'dias') return responderDias(interaction);
+    if (interaction.commandName === 'assinaturas') return responderLista(interaction);
+    if (interaction.commandName !== 'gerarlink') return;
     if (interaction.user.id !== OWNER_ID) {
       return interaction.reply({ content: 'Sem permissão.', flags: MessageFlags.Ephemeral });
     }
