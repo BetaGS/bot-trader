@@ -1,0 +1,14 @@
+{
+  "name": "bot-trader-infinitepay",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "resend": "^6.32.1"
+  }
+}

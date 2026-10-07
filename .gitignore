@@ -1,0 +1,11 @@
+# Variáveis de ambiente (senhas e tokens)
+.env
+
+# Dependências do Node.js
+node_modules/
+
+# Logs e arquivos temporários
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
