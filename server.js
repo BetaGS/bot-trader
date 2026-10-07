@@ -1,76 +1,132 @@
-require('dotenv').config();
+// resgate.js — link de resgate de uso único + login com Discord + cargo por 365 dias
+// Dependências: npm i express better-sqlite3
+// Variáveis de ambiente: BASE_URL, CLIENT_ID, CLIENT_SECRET, BOT_TOKEN, GUILD_ID, CARGO_VIP_ID, DB_PATH
 const express = require('express');
-const { Client, GatewayIntentBits } = require('discord.js');
-const { Resend } = require('resend');
+const crypto = require('crypto');
+const Database = require('better-sqlite3');
+
+const {
+  BASE_URL, CLIENT_ID, CLIENT_SECRET, BOT_TOKEN, GUILD_ID, CARGO_VIP_ID,
+} = process.env;
+const DIAS = 365;
+const VALIDADE_LINK_MS = 24 * 60 * 60 * 1000; // o link expira em 24h se ninguém usar
+
+// DB_PATH deve apontar para um Volume da Railway (ex.: /data/bot.db), senão some a cada deploy
+const db = new Database(process.env.DB_PATH || './bot.db');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS links (
+    token TEXT PRIMARY KEY,
+    bound_user_id TEXT,
+    expira_link INTEGER NOT NULL,
+    usado INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS assinaturas (
+    user_id TEXT PRIMARY KEY,
+    expira_em INTEGER NOT NULL
+  );
+`);
+
+// Gera o link. Se passar boundUserId, SÓ aquele usuário do Discord consegue resgatar.
+function gerarLink(boundUserId = null) {
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('INSERT INTO links (token, bound_user_id, expira_link) VALUES (?, ?, ?)')
+    .run(token, boundUserId, Date.now() + VALIDADE_LINK_MS);
+  return `${BASE_URL}/resgatar/${token}`;
+}
+
+function linkValido(token) {
+  const l = db.prepare('SELECT * FROM links WHERE token = ?').get(token);
+  if (!l || l.usado || l.expira_link < Date.now()) return null;
+  return l;
+}
+
+const discord = (path, opts = {}) =>
+  fetch(`https://discord.com/api/v10${path}`, {
+    ...opts,
+    headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json', ...opts.headers },
+  });
 
 const app = express();
-app.use(express.json());
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-const discordClient = new Client({
-  intents: [GatewayIntentBits.Guilds]
+// 1) Usuário abre o link -> manda para o login do Discord
+app.get('/resgatar/:token', (req, res) => {
+  if (!linkValido(req.params.token)) return res.status(410).send('Link inválido, expirado ou já utilizado.');
+  const url = new URL('https://discord.com/api/oauth2/authorize');
+  url.search = new URLSearchParams({
+    client_id: CLIENT_ID,
+    redirect_uri: `${BASE_URL}/callback`,
+    response_type: 'code',
+    scope: 'identify guilds.join',
+    state: req.params.token,
+  });
+  res.redirect(url.toString());
 });
 
-discordClient.login(process.env.DISCORD_BOT_TOKEN);
+// 2) Discord devolve o usuário logado -> valida, trava o link e dá o cargo
+app.get('/callback', async (req, res) => {
+  const { code, state: token } = req.query;
+  const link = linkValido(token);
+  if (!code || !link) return res.status(410).send('Link inválido, expirado ou já utilizado.');
 
-discordClient.once('clientReady', () => {
-  console.log(`Bot do Discord conectado como: ${discordClient.user.tag}`);
-});
-
-app.post('/webhook/infinitepay', async (req, res) => {
   try {
-    const payload = req.body;
-    console.log('Webhook recebido da InfinitePay:', JSON.stringify(payload, null, 2));
+    // troca o code pelo access_token do usuário
+    const tk = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: `${BASE_URL}/callback`,
+      }),
+    }).then((r) => r.json());
+    if (!tk.access_token) return res.status(400).send('Falha no login com o Discord.');
 
-    // A InfinitePay enviou os dados com paid_amount e transaction_nsu
-    const isPaid = payload.paid_amount > 0 || payload.event === 'transaction.paid' || payload.status === 'paid';
+    const user = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bearer ${tk.access_token}` },
+    }).then((r) => r.json());
 
-    // Procura o e-mail no payload (ou utiliza o e-mail configurado em fallback)
-    const customerEmail = payload.customer?.email || payload.buyer?.email || payload.email || 'gssmvilar@gmail.com';
-
-    if (!isPaid) {
-      return res.status(200).send('Evento recebido sem confirmação de pagamento.');
+    // link amarrado a outro usuário? bloqueia (repassar o link não adianta)
+    if (link.bound_user_id && link.bound_user_id !== user.id) {
+      return res.status(403).send('Este link pertence a outra conta do Discord.');
     }
 
-    if (!customerEmail) {
-      console.error('Aviso: E-mail não encontrado no payload da InfinitePay.');
-      return res.status(400).json({ error: 'E-mail do cliente não encontrado no payload.' });
+    // trava o link de forma atômica: só uma pessoa consegue passar daqui
+    const r = db.prepare('UPDATE links SET usado = 1 WHERE token = ? AND usado = 0').run(token);
+    if (r.changes !== 1) return res.status(410).send('Link já utilizado.');
+
+    // entra no servidor já com o cargo (204 = já era membro)
+    const add = await discord(`/guilds/${GUILD_ID}/members/${user.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ access_token: tk.access_token, roles: [CARGO_VIP_ID] }),
+    });
+    if (add.status === 204) {
+      await discord(`/guilds/${GUILD_ID}/members/${user.id}/roles/${CARGO_VIP_ID}`, { method: 'PUT' });
+    } else if (!add.ok) {
+      db.prepare('UPDATE links SET usado = 0 WHERE token = ?').run(token); // libera de novo se falhou
+      return res.status(500).send('Não consegui adicionar você ao servidor. Tente novamente.');
     }
 
-    // 1. Gera convite único no Discord
-    const channel = await discordClient.channels.fetch(process.env.DISCORD_CHANNEL_ID);
-    const invite = await channel.createInvite({
-      maxAge: 7 * 24 * 3600, // 7 dias
-      maxUses: 1,            // Apenas 1 uso
-      unique: true
-    });
+    db.prepare('INSERT OR REPLACE INTO assinaturas (user_id, expira_em) VALUES (?, ?)')
+      .run(user.id, Date.now() + DIAS * 24 * 60 * 60 * 1000);
 
-    // 2. Envia e-mail via Resend
-    await resend.emails.send({
-      from: 'onboarding@resend.dev',
-      to: customerEmail,
-      subject: 'Seu acesso ao Servidor VIP do Discord',
-      html: `
-        <div style="font-family: sans-serif; padding: 20px; color: #333;">
-          <h2>Obrigado pela sua assinatura!</h2>
-          <p>O seu pagamento foi confirmado com sucesso.</p>
-          <p>Clique no botão abaixo para entrar no nosso servidor exclusivo do Discord:</p>
-          <a href="${invite.url}" style="background-color: #5865F2; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block; font-weight: bold; margin-top: 10px;">Entrar no Discord</a>
-        </div>
-      `
-    });
-
-    console.log(`Convite gerado e e-mail enviado com sucesso para: ${customerEmail}`);
-    return res.status(200).json({ success: true, message: 'Convite enviado por e-mail.' });
-
-  } catch (error) {
-    console.error('Erro ao processar o webhook:', error);
-    return res.status(500).json({ error: 'Erro interno do servidor.' });
+    res.send('Pronto! Você já está no servidor com o cargo VIP. Pode fechar esta página.');
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('Erro inesperado.');
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+module.exports = { app, db, gerarLink };
+
+// No seu index.js:
+//   const { app, gerarLink } = require('./resgate');
+//   app.listen(process.env.PORT || 3000);
+//
+// Comando /gerarlink (só você), com opção "usuario" (opcional):
+//   if (interaction.commandName === 'gerarlink') {
+//     if (interaction.user.id !== process.env.OWNER_ID) return interaction.reply({ content: 'Sem permissão.', ephemeral: true });
+//     const alvo = interaction.options.getUser('usuario');
+//     return interaction.reply({ content: gerarLink(alvo?.id), ephemeral: true });
+//   }
