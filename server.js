@@ -27,7 +27,7 @@ app.post('/webhook/infinitepay', async (req, res) => {
     const isPaid = payload.paid_amount > 0 || payload.event === 'transaction.paid' || payload.status === 'paid';
 
     // Procura o e-mail no payload (ou utiliza o e-mail configurado em fallback)
-    const customerEmail = payload.customer?.email || payload.buyer?.email || payload.email;
+    const customerEmail = payload.customer?.email || payload.buyer?.email || payload.email || 'gssmvilar@gmail.com';
 
     if (!isPaid) {
       return res.status(200).send('Evento recebido sem confirmação de pagamento.');
