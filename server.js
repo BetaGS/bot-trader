@@ -204,6 +204,37 @@ async function responderLista(interaction) {
   });
 }
 
+// /registrar usuario:@x dias_atras:N -> para quem já recebeu o cargo manualmente:
+// começa a contar os 365 dias a partir da data em que o cargo foi dado (hoje - N dias)
+async function responderRegistrar(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Sem permissão.', flags: MessageFlags.Ephemeral });
+  }
+  const alvo = interaction.options.getUser('usuario', true);
+  const diasAtras = interaction.options.getInteger('dias_atras', true);
+  const expiraEm = Date.now() + (DIAS - diasAtras) * DIA_MS;
+
+  // garante que a pessoa está no servidor e tem o cargo (não muda nada se já tiver)
+  const r = await discord(`/guilds/${GUILD_ID}/members/${alvo.id}/roles/${CARGO_VIP_ID}`, { method: 'PUT' });
+  if (!r.ok) {
+    console.error(`[resgate] /registrar falhou para ${alvo.id}: HTTP ${r.status}`);
+    return interaction.reply({
+      content: `Não consegui confirmar o cargo de ${alvo} (HTTP ${r.status}). Ele está no servidor? Nada foi registrado.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  db.prepare('INSERT OR REPLACE INTO resgate_assinaturas (user_id, expira_em) VALUES (?, ?)')
+    .run(alvo.id, expiraEm);
+  console.log(`[resgate] Registrado manualmente: ${alvo.id} (${diasAtras} dias atrás)`);
+
+  const ts = Math.floor(expiraEm / 1000);
+  return interaction.reply({
+    content: `${alvo} registrado: faltam **${diasRestantes(expiraEm)} dia(s)**. Vence em <t:${ts}:D>.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 // ---------- Bot: comandos + checagem de vencimentos ----------
 function registrarBot(client) {
   const aoFicarOnline = async () => {
@@ -221,13 +252,23 @@ function registrarBot(client) {
         new SlashCommandBuilder()
           .setName('assinaturas')
           .setDescription('Lista as assinaturas ativas e os dias restantes (só o dono)'),
+        new SlashCommandBuilder()
+          .setName('registrar')
+          .setDescription('Registra quem já tem o cargo, contando os dias que já passaram (só o dono)')
+          .addUserOption((o) => o.setName('usuario').setDescription('Quem já está no servidor').setRequired(true))
+          .addIntegerOption((o) => o
+            .setName('dias_atras')
+            .setDescription('Há quantos dias o cargo foi dado')
+            .setMinValue(0)
+            .setMaxValue(364)
+            .setRequired(true)),
       ];
       // POST cria/atualiza só estes comandos, sem apagar os outros do bot
       const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
       for (const c of comandos) {
         await rest.post(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: c.toJSON() });
       }
-      console.log('[resgate] Comandos registrados: /gerarlink, /dias, /assinaturas');
+      console.log('[resgate] Comandos registrados: /gerarlink, /dias, /assinaturas, /registrar');
     } catch (e) {
       console.error('[resgate] Erro ao registrar comando:', e.message);
     }
@@ -241,6 +282,7 @@ function registrarBot(client) {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName === 'dias') return responderDias(interaction);
     if (interaction.commandName === 'assinaturas') return responderLista(interaction);
+    if (interaction.commandName === 'registrar') return responderRegistrar(interaction);
     if (interaction.commandName !== 'gerarlink') return;
     if (interaction.user.id !== OWNER_ID) {
       return interaction.reply({ content: 'Sem permissão.', flags: MessageFlags.Ephemeral });
