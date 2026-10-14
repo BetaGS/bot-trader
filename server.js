@@ -28,7 +28,12 @@ for (const nome of ['BASE_URL', 'CLIENT_ID', 'CLIENT_SECRET', 'BOT_TOKEN', 'GUIL
 
 // DB_PATH deve apontar para o Volume da Railway (ex.: /data/bot.db)
 // Tabelas com prefixo "resgate_" para não conflitar com as do fluxo da InfinitePay
-const db = new Database(process.env.DB_PATH || './bot.db');
+const caminhoDb = process.env.DB_PATH || './bot.db';
+if (!process.env.DB_PATH) {
+  console.error('[resgate] ATENÇÃO: DB_PATH não definido. O banco fica fora do volume e É APAGADO a cada deploy!');
+}
+const db = new Database(caminhoDb);
+console.log(`[resgate] Banco de dados em: ${caminhoDb}`);
 db.exec(`
   CREATE TABLE IF NOT EXISTS resgate_links (
     token TEXT PRIMARY KEY,
@@ -235,6 +240,29 @@ async function responderRegistrar(interaction) {
   });
 }
 
+// /remover usuario:@x [remover_cargo:não] -> tira a pessoa do controle de assinaturas
+// e, por padrão, também remove o cargo VIP dela
+async function responderRemover(interaction) {
+  if (interaction.user.id !== OWNER_ID) {
+    return interaction.reply({ content: 'Sem permissão.', flags: MessageFlags.Ephemeral });
+  }
+  const alvo = interaction.options.getUser('usuario', true);
+  const tirarCargo = interaction.options.getBoolean('remover_cargo') ?? true;
+
+  const existia = db.prepare('DELETE FROM resgate_assinaturas WHERE user_id = ?').run(alvo.id).changes === 1;
+  let cargo = 'Cargo mantido.';
+  if (tirarCargo) {
+    const r = await discord(`/guilds/${GUILD_ID}/members/${alvo.id}/roles/${CARGO_VIP_ID}`, { method: 'DELETE' });
+    if (r.ok) cargo = 'Cargo removido.';
+    else if (r.status === 404) cargo = 'Ele não está no servidor.';
+    else cargo = `Não consegui remover o cargo (HTTP ${r.status}).`;
+  }
+  console.log(`[resgate] Removido manualmente: ${alvo.id} (${cargo})`);
+
+  const registro = existia ? 'Removido das assinaturas.' : 'Ele não estava registrado nas assinaturas.';
+  return interaction.reply({ content: `${alvo}: ${registro} ${cargo}`, flags: MessageFlags.Ephemeral });
+}
+
 // ---------- Bot: comandos + checagem de vencimentos ----------
 function registrarBot(client) {
   const aoFicarOnline = async () => {
@@ -262,13 +290,20 @@ function registrarBot(client) {
             .setMinValue(0)
             .setMaxValue(364)
             .setRequired(true)),
+        new SlashCommandBuilder()
+          .setName('remover')
+          .setDescription('Remove alguém das assinaturas (só o dono)')
+          .addUserOption((o) => o.setName('usuario').setDescription('Quem será removido').setRequired(true))
+          .addBooleanOption((o) => o
+            .setName('remover_cargo')
+            .setDescription('Tirar também o cargo VIP? (padrão: sim)')),
       ];
       // POST cria/atualiza só estes comandos, sem apagar os outros do bot
       const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
       for (const c of comandos) {
         await rest.post(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: c.toJSON() });
       }
-      console.log('[resgate] Comandos registrados: /gerarlink, /dias, /assinaturas, /registrar');
+      console.log('[resgate] Comandos registrados: /gerarlink, /dias, /assinaturas, /registrar, /remover');
     } catch (e) {
       console.error('[resgate] Erro ao registrar comando:', e.message);
     }
@@ -283,6 +318,7 @@ function registrarBot(client) {
     if (interaction.commandName === 'dias') return responderDias(interaction);
     if (interaction.commandName === 'assinaturas') return responderLista(interaction);
     if (interaction.commandName === 'registrar') return responderRegistrar(interaction);
+    if (interaction.commandName === 'remover') return responderRemover(interaction);
     if (interaction.commandName !== 'gerarlink') return;
     if (interaction.user.id !== OWNER_ID) {
       return interaction.reply({ content: 'Sem permissão.', flags: MessageFlags.Ephemeral });
